@@ -65,33 +65,44 @@ export function readPkt(buf: Buffer, at: number): PktLine {
 // Pack reading and writing.
 // ----------------------------------------------------------------------------------------------
 
+/** Adler-32 of a payload (the checksum every zlib stream ends with), as 4 big-endian bytes. */
+function adlerTail(data: Buffer): Buffer {
+  let a = 1;
+  let b = 0;
+  for (let index = 0; index < data.length; index += 1) {
+    a = (a + data[index]!) % 65521;
+    b = (b + a) % 65521;
+  }
+  const tail = Buffer.alloc(4);
+  tail.writeUInt32BE(((b << 16) | a) >>> 0, 0);
+  return tail;
+}
+
 /**
  * Inflate the first zlib stream in `buf`, answering its data and exact consumed length.
- * inflateSync ignores trailing bytes and throws on a truncated stream, so the consumed length
- * is the smallest prefix that inflates — found by an exponential probe plus a binary search.
+ * inflateSync ignores trailing bytes and throws on a truncated stream, so one call on the
+ * whole remainder yields the stream's data; the stream's end is then the first place its
+ * trailing Adler-32 checksum sits that itself verifies — one scan and one confirming
+ * inflate, instead of a binary search of full inflates.
  */
 export function inflateFirst(buf: Buffer): { data: Buffer; consumed: number } {
-  const ok = (n: number): boolean => {
+  let data: Buffer;
+  try {
+    data = inflateSync(buf);
+  } catch {
+    throw new Error('corrupt zlib stream in pack');
+  }
+  const tail = adlerTail(data);
+  // A stream is at least a 2-byte header, one deflate byte and the 4-byte checksum.
+  for (let at = buf.indexOf(tail, 3); at !== -1; at = buf.indexOf(tail, at + 1)) {
+    const end = at + 4;
     try {
-      inflateSync(buf.subarray(0, n));
-      return true;
+      if (inflateSync(buf.subarray(0, end)).equals(data)) return { data, consumed: end };
     } catch {
-      return false;
+      // Not the end: the checksum bytes appear inside the compressed data. Keep scanning.
     }
-  };
-  let lo = 1;
-  let hi = Math.min(buf.length, 256);
-  while (hi < buf.length && !ok(hi)) {
-    lo = hi + 1;
-    hi = Math.min(buf.length, hi * 2);
   }
-  if (!ok(hi)) throw new Error('corrupt zlib stream in pack');
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    if (ok(mid)) hi = mid;
-    else lo = mid + 1;
-  }
-  return { data: inflateSync(buf.subarray(0, lo)), consumed: lo };
+  throw new Error('corrupt zlib stream in pack');
 }
 
 /** Apply a git delta payload to a base payload. */
@@ -295,6 +306,16 @@ function advertisementLines(repo: Repo, service: 'git-upload-pack' | 'git-receiv
   return lines;
 }
 
+/** The v2 capability advertisement: identical for every repository, so it is built once. */
+const V2_ADVERTISEMENT = Buffer.concat([
+  pkt('version 2'),
+  pkt(`agent=${AGENT}`),
+  pkt('ls-refs=unborn'),
+  pkt('fetch=shallow'),
+  pkt('object-format=sha1'),
+  FLUSH,
+]);
+
 /** GET /{owner}/{repo}.git/info/refs — v0 with a service preamble, or the v2 capability list. */
 export function infoRefs(repo: Repo, service: string, protocolVersion: number): { status: number; contentType: string; body: Buffer } {
   if (service !== 'git-upload-pack' && service !== 'git-receive-pack') {
@@ -302,15 +323,7 @@ export function infoRefs(repo: Repo, service: string, protocolVersion: number): 
   }
   const contentType = `application/x-${service}-advertisement`;
   if (protocolVersion === 2 && service === 'git-upload-pack') {
-    const lines = [
-      pkt('version 2'),
-      pkt(`agent=${AGENT}`),
-      pkt('ls-refs=unborn'),
-      pkt('fetch=shallow'),
-      pkt('object-format=sha1'),
-      FLUSH,
-    ];
-    return { status: 200, contentType, body: Buffer.concat(lines) };
+    return { status: 200, contentType, body: V2_ADVERTISEMENT };
   }
   const parts = [pkt(`# service=${service}`), FLUSH, ...advertisementLines(repo, service), FLUSH];
   return { status: 200, contentType, body: Buffer.concat(parts) };
@@ -425,8 +438,12 @@ function includedAncestors(repo: Repo, wants: Set<string>, boundary: Set<string>
   return included;
 }
 
-/** Commits grouped by generation distance from the wants (want = generation 1), BFS order. */
-function generations(repo: Repo, wants: string[]): Map<string, number> {
+/**
+ * Commits grouped by generation distance from the wants (want = generation 1), BFS order.
+ * The walk does not descend past `maxLevel`: a depth-limited fetch only ever reads the
+ * levels it keeps, so walking the whole history to fill the rest is wasted work.
+ */
+function generations(repo: Repo, wants: string[], maxLevel: number): Map<string, number> {
   const depth = new Map<string, number>();
   let frontier = [...new Set(wants)];
   let level = 1;
@@ -437,7 +454,7 @@ function generations(repo: Repo, wants: string[]): Map<string, number> {
       const object = repo.objects.get(oid);
       if (object === undefined || object.type !== 'commit') continue;
       depth.set(oid, level);
-      next.push(...parseCommit(object.data).parents);
+      if (level < maxLevel) next.push(...parseCommit(object.data).parents);
     }
     frontier = next;
     level += 1;
@@ -483,7 +500,7 @@ export function planFetch(repo: Repo, request: FetchRequest): { send: string[]; 
     // moves down, it does not expand sideways below the old boundary.
     const depthLimit = request.deepen ?? Number.MAX_SAFE_INTEGER;
     included = new Set<string>();
-    for (const [oid, level] of generations(repo, [...wantCommits])) {
+    for (const [oid, level] of generations(repo, [...wantCommits], depthLimit)) {
       if (level <= depthLimit) included.add(oid);
     }
     if (request.deepenSince !== null) {
@@ -530,14 +547,33 @@ export function planFetch(repo: Repo, request: FetchRequest): { send: string[]; 
   return { send: [...sendSet], shallowLines };
 }
 
+/**
+ * Built packs by their exact object-id list, per repository. buildPack is deterministic and
+ * stored objects are never mutated or deleted, so an identical send list always builds the
+ * identical pack; repeat fetches of the same history (the common clone/fetch pattern) skip
+ * the deflate and hashing work. The cache is bounded and simply dropped when it grows.
+ */
+const packCache = new WeakMap<Repo, Map<string, Buffer>>();
+
 /** Build the pack bytes for a set of object ids. */
 export function packFor(repo: Repo, oids: string[]): Buffer {
+  let cache = packCache.get(repo);
+  if (cache === undefined) {
+    cache = new Map();
+    packCache.set(repo, cache);
+  }
+  const key = oids.join(' ');
+  const cached = cache.get(key);
+  if (cached !== undefined) return cached;
   const objects: { type: ObjectType; data: Buffer }[] = [];
   for (const oid of oids) {
     const object = repo.objects.get(oid);
     if (object !== undefined) objects.push(object);
   }
-  return buildPack(objects);
+  const pack = buildPack(objects);
+  if (cache.size >= 128) cache.clear();
+  cache.set(key, pack);
+  return pack;
 }
 
 /** Frame pack bytes as side-band-64k packets (band 1), optionally with a final flush. */

@@ -334,7 +334,21 @@ export function ancestorsOf(repo: Repo, tip: string): Set<string> {
 }
 
 export function isAncestor(repo: Repo, ancestor: string, tip: string): boolean {
-  return ancestorsOf(repo, tip).has(ancestor);
+  // The same reachability question ancestorsOf answers, but the walk stops the moment the
+  // ancestor turns up (the common case — a push's parent — is one step from the tip) instead
+  // of first collecting the tip's whole history.
+  const seen = new Set<string>();
+  const queue = [tip];
+  while (queue.length > 0) {
+    const current = queue.pop()!;
+    if (current === ancestor) return true;
+    if (seen.has(current)) continue;
+    seen.add(current);
+    const object = repo.objects.get(current);
+    if (object === undefined || object.type !== 'commit') continue;
+    queue.push(...parseCommit(object.data).parents);
+  }
+  return false;
 }
 
 /** A common ancestor of two commits (breadth-first from both), or null. */

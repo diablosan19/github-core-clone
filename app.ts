@@ -31,13 +31,14 @@ function nextRequestId(): string {
 
 function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
   const text = body === null || body === undefined ? '' : `${JSON.stringify(body)}\n`;
+  const bytes = Buffer.from(text, 'utf8');
   res.writeHead(status, {
     'content-type': JSON_TYPE,
-    'content-length': Buffer.byteLength(text),
+    'content-length': bytes.length,
     'x-github-request-id': nextRequestId(),
     ...headers,
   });
-  res.end(text);
+  res.end(bytes);
 }
 
 function sendBuffer(res: ServerResponse, status: number, contentType: string, body: Buffer): void {
@@ -58,13 +59,16 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
       }
       chunks.push(chunk);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('end', () => resolve(chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks)));
     req.on('error', reject);
   });
 }
 
+/** The bearer token is fixed for the process's life (the env sets it before launch). */
+const EXPECTED_TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+
 function expectedToken(): string {
-  return process.env.MAKEFUN_SHOP_TOKEN ?? '';
+  return EXPECTED_TOKEN;
 }
 
 function authorized(req: IncomingMessage): boolean {
@@ -89,7 +93,7 @@ function segmentsOf(req: IncomingMessage): { segments: string[]; query: URLSearc
   return { segments, query: url.searchParams };
 }
 
-async function handleGit(req: IncomingMessage, res: ServerResponse, segments: string[]): Promise<void> {
+async function handleGit(req: IncomingMessage, res: ServerResponse, segments: string[], query: URLSearchParams): Promise<void> {
   const [owner, repoGit, ...rest] = segments as [string, string, ...string[]];
   const repoName = repoGit.endsWith('.git') ? repoGit.slice(0, -'.git'.length) : repoGit;
   store.adoptLogin(owner ?? '');
@@ -100,7 +104,6 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, segments: st
   }
   const tail = rest.join('/');
   if (req.method === 'GET' && tail === 'info/refs') {
-    const query = new URL(req.url ?? '/', 'http://entry').searchParams;
     const service = query.get('service') ?? '';
     const protocolHeader = req.headers['git-protocol'];
     const version = typeof protocolHeader === 'string' && protocolHeader.includes('version=2') ? 2 : 0;
@@ -157,7 +160,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   }
 
   if (isGit) {
-    await handleGit(req, res, segments);
+    await handleGit(req, res, segments, query);
     return;
   }
 
